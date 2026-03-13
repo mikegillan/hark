@@ -1,0 +1,345 @@
+#!/usr/bin/env node
+'use strict';
+
+// ──────────────────────────────────────────────────────────────────────────────
+// hark — interactive TUI for Node.js processes, grouped by PID
+//
+// Usage:  hark [port]     (no port = all listening node processes)
+// Install: chmod +x hark && mv hark /usr/local/bin/hark
+//
+// Keys:  ↑↓ navigate   x sigterm   k sigkill   r refresh   esc/ctrl-c quit
+// ──────────────────────────────────────────────────────────────────────────────
+
+const { execSync } = require('child_process');
+const fs           = require('fs');
+
+const PORT_ARG     = process.argv[2] ? parseInt(process.argv[2], 10) : null;
+if (process.argv[2] && isNaN(PORT_ARG)) {
+  console.error('Usage: hark [port]');
+  process.exit(1);
+}
+const SIGTERM_WAIT = 2500;
+const AUTO_REFRESH = 4000;
+
+// ── ANSI ──────────────────────────────────────────────────────────────────────
+const A = {
+  reset:       '\x1B[0m',
+  bold:        '\x1B[1m',
+  dim:         '\x1B[2m',
+  clear:       '\x1B[2J\x1B[H',
+  hideCursor:  '\x1B[?25l',
+  showCursor:  '\x1B[?25h',
+  eol:         '\x1B[K',
+  red:         '\x1B[31m',
+  green:       '\x1B[32m',
+  yellow:      '\x1B[33m',
+  blue:        '\x1B[34m',
+  cyan:        '\x1B[36m',
+  gray:        '\x1B[90m',
+  brightRed:   '\x1B[91m',
+  brightGreen: '\x1B[92m',
+  brightYellow:'\x1B[93m',
+  brightCyan:  '\x1B[96m',
+  brightWhite: '\x1B[97m',
+  bgNavy:      '\x1B[48;5;17m',
+  bgTeal:      '\x1B[48;5;23m',
+};
+
+// ── Port label heuristics ─────────────────────────────────────────────────────
+// 9229/9230 are the Node.js inspector ports — these are definitive.
+// Everything else is best-effort based on common dev conventions.
+const PORT_LABELS = {
+  9229:  { label: 'inspector', color: A.blue   },
+  9230:  { label: 'inspector', color: A.blue   },
+  3000:  { label: 'server',    color: A.green  },
+  3001:  { label: 'server',    color: A.green  },
+  4000:  { label: 'server',    color: A.green  },
+  4321:  { label: 'astro',     color: A.cyan   },
+  5173:  { label: 'vite',      color: A.cyan   },
+  5174:  { label: 'vite',      color: A.cyan   },
+  6006:  { label: 'storybook', color: A.cyan   },
+  8080:  { label: 'server',    color: A.green  },
+  8000:  { label: 'server',    color: A.green  },
+  8888:  { label: 'notebook',  color: A.cyan   },
+  24678: { label: 'hmr',       color: A.dim    },
+};
+
+function portLabel(port) {
+  return PORT_LABELS[port] ?? { label: 'tcp', color: A.dim };
+}
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let processes   = [];
+let selectedIdx = 0;
+let statusMsg   = '';
+let autoTimer   = null;
+let killing     = false;
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function sh(cmd) {
+  try {
+    return execSync(cmd, { encoding: 'utf8', stdio: ['pipe','pipe','ignore'] }).trim();
+  } catch { return ''; }
+}
+
+function isAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function trunc(s, n) {
+  if (!s) return '';
+  return s.length > n ? s.slice(0, n - 1) + '…' : s;
+}
+
+function pad(s, n) { return String(s ?? '').padEnd(n); }
+function termW()    { return process.stdout.columns || 120; }
+function hline()    { return A.dim + '─'.repeat(termW()) + A.reset; }
+
+function clampIdx() {
+  if (selectedIdx >= processes.length) selectedIdx = Math.max(0, processes.length - 1);
+}
+
+// ── Data ──────────────────────────────────────────────────────────────────────
+function fetchProcesses() {
+  const cmd = PORT_ARG
+    ? `lsof -i :${PORT_ARG} -sTCP:LISTEN -n -P`
+    : `lsof -i TCP -sTCP:LISTEN -n -P`;
+
+  const raw = sh(cmd);
+  if (!raw) return [];
+
+  const byPid = new Map();
+
+  for (const line of raw.split('\n').slice(1)) {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 9) continue;
+
+    const procName = parts[0];
+    const pid      = parseInt(parts[1], 10);
+    if (!PORT_ARG && procName !== 'node') continue;
+
+    const nameField = parts[8];
+    const port      = parseInt(nameField.split(':').pop(), 10) || null;
+    if (!port) continue;
+
+    if (!byPid.has(pid)) {
+      const prev = processes.find(p => p.pid === pid);
+      byPid.set(pid, {
+        procName,
+        pid,
+        ports:      [],
+        status:     prev?.status     ?? 'running',
+        cmd:        prev?.cmd        ?? '',
+        pkgName:    prev?.pkgName    ?? null,
+        pkgVersion: prev?.pkgVersion ?? null,
+        cwd:        prev?.cwd        ?? null,
+      });
+    }
+
+    const entry = byPid.get(pid);
+    if (!entry.ports.includes(port)) entry.ports.push(port);
+  }
+
+  return [...byPid.values()];
+}
+
+function enrichProcess(proc) {
+  proc.cmd = sh(`ps -p ${proc.pid} -o command=`) || proc.procName;
+  if (proc.procName !== 'node') return;
+
+  const cwdRaw  = sh(`lsof -p ${proc.pid} -a -d cwd -n`);
+  const cwdLine = cwdRaw.split('\n').slice(1)[0] ?? '';
+  const cwd     = cwdLine.trim().split(/\s+/).pop() || null;
+  proc.cwd      = cwd;
+
+  if (!cwd) return;
+  try {
+    const pkg       = JSON.parse(fs.readFileSync(`${cwd}/package.json`, 'utf8'));
+    proc.pkgName    = pkg.name    ?? null;
+    proc.pkgVersion = pkg.version ?? null;
+  } catch {}
+}
+
+function refresh() {
+  if (killing) return;
+  const fresh = fetchProcesses();
+  fresh.forEach(enrichProcess);
+  processes = fresh;
+  clampIdx();
+  render();
+}
+
+// ── Rendering ─────────────────────────────────────────────────────────────────
+function render() {
+  const W     = termW();
+  const title = PORT_ARG ? `port ${PORT_ARG}` : 'all node processes';
+
+  const cStat = 18;
+  const cPid  = 8;
+  const cName = 26;
+  const cCmd  = Math.max(10, W - cStat - cPid - cName - 6);
+
+  let out = A.clear + A.hideCursor;
+
+  // ── Header ────────────────────────────────────────────────────────────────
+  out += A.bgTeal + A.bold + A.brightCyan;
+  out += `  ◈ hark  `;
+  out += A.reset + A.bgTeal + A.dim + A.cyan;
+  out += `  listening on ${title}`;
+  out += A.eol + A.reset + '\n';
+  out += hline() + '\n';
+
+  // ── Column headings ───────────────────────────────────────────────────────
+  out += A.dim + A.bold;
+  out += `    ${pad('STATUS', cStat)}${pad('PID', cPid)}${pad('PACKAGE / PROCESS', cName)}COMMAND`;
+  out += A.reset + '\n';
+  out += hline() + '\n';
+
+  // ── Process rows ──────────────────────────────────────────────────────────
+  if (processes.length === 0) {
+    const msg = PORT_ARG
+      ? `Nothing is listening on port ${PORT_ARG}.`
+      : 'No node processes found listening on any port.';
+    out += `\n  ${A.dim}${msg}${A.reset}\n`;
+  } else {
+    for (let i = 0; i < processes.length; i++) {
+      const p    = processes[i];
+      const sel  = i === selectedIdx;
+      const dead = p.status === 'not-responding';
+      const bg   = sel ? A.bgNavy : '';
+
+      const nameStr   = p.pkgName
+        ? trunc(p.pkgName + (p.pkgVersion ? `@${p.pkgVersion}` : ''), cName - 1)
+        : trunc(p.procName, cName - 1);
+      const cmdStr    = trunc(p.cmd, cCmd);
+      const statusStr = dead ? '⚠ not responding' : '● running';
+
+      const statColor = dead
+        ? (sel ? A.brightRed    : A.red)
+        : (sel ? A.brightGreen  : A.green);
+      const pidColor  = sel ? A.brightYellow : A.yellow;
+      const nameColor = sel ? A.brightCyan   : A.cyan;
+      const cmdColor  = sel ? A.brightWhite  : A.gray;
+      const arrow     = sel ? `${A.brightWhite}▶${A.reset}${bg}` : ' ';
+
+      // Main row
+      out += bg;
+      out += ` ${arrow} `;
+      out += statColor + pad(statusStr, cStat) + A.reset + bg;
+      out += pidColor  + pad(p.pid,     cPid)  + A.reset + bg;
+      out += nameColor + pad(nameStr,   cName) + A.reset + bg;
+      out += cmdColor  + cmdStr                + A.reset;
+      out += A.eol + A.reset + '\n';
+
+      // Port detail lines
+      const sorted = [...p.ports].sort((a, b) => a - b);
+      for (let j = 0; j < sorted.length; j++) {
+        const port   = sorted[j];
+        const last   = j === sorted.length - 1;
+        const corner = last ? '└─' : '├─';
+        const { label, color } = portLabel(port);
+
+        out += `    ${A.dim}${corner} tcp ${A.reset}`;
+        out += `${A.bold}${color}${port}${A.reset}`;
+        out += `  ${A.dim}${label}${A.reset}`;
+        out += '\n';
+      }
+    }
+  }
+
+  // ── Status message ────────────────────────────────────────────────────────
+  out += '\n';
+  if (statusMsg) {
+    out += `  ${A.yellow}${statusMsg}${A.reset}\n`;
+  }
+
+  // ── Footer ────────────────────────────────────────────────────────────────
+  out += hline() + '\n';
+  out += `  ${A.dim}↑↓ navigate  `;
+  out += `${A.reset}${A.yellow}x${A.reset}${A.dim} sigterm  `;
+  out += `${A.reset}${A.brightRed}k${A.reset}${A.dim} sigkill  `;
+  out += `${A.reset}${A.cyan}r${A.reset}${A.dim} refresh  `;
+  out += `${A.reset}${A.dim}esc / ctrl-c  quit${A.reset}\n`;
+
+  process.stdout.write(out);
+}
+
+// ── Kill logic ────────────────────────────────────────────────────────────────
+function doKill(signal) {
+  const proc = processes[selectedIdx];
+  if (!proc) return;
+
+  const label = proc.pkgName || proc.procName;
+
+  try {
+    process.kill(proc.pid, signal);
+  } catch (e) {
+    statusMsg = `✗ Could not send ${signal} to PID ${proc.pid}: ${e.message}`;
+    render();
+    return;
+  }
+
+  if (signal === 'SIGKILL') {
+    statusMsg = `Sent SIGKILL to ${label} (PID ${proc.pid})`;
+    render();
+    setTimeout(() => { statusMsg = ''; refresh(); }, 600);
+  } else {
+    killing   = true;
+    statusMsg = `Sent SIGTERM to ${label} (PID ${proc.pid}) — waiting ${SIGTERM_WAIT / 1000}s…`;
+    render();
+
+    setTimeout(() => {
+      killing = false;
+      if (isAlive(proc.pid)) {
+        const p = processes.find(pr => pr.pid === proc.pid);
+        if (p) p.status = 'not-responding';
+        statusMsg = `⚠ ${label} (PID ${proc.pid}) is not responding — press k to force kill`;
+      } else {
+        processes = processes.filter(pr => pr.pid !== proc.pid);
+        clampIdx();
+        statusMsg = `✓ ${label} (PID ${proc.pid}) stopped`;
+      }
+      render();
+    }, SIGTERM_WAIT);
+  }
+}
+
+// ── Input handling ────────────────────────────────────────────────────────────
+function handleKey(chunk) {
+  switch (chunk) {
+    case '\x03':
+    case '\x1B':    quit(); break;
+    case '\x1B[A':
+      if (selectedIdx > 0) { selectedIdx--; statusMsg = ''; render(); }
+      break;
+    case '\x1B[B':
+      if (selectedIdx < processes.length - 1) { selectedIdx++; statusMsg = ''; render(); }
+      break;
+    case 'x': case 'X': doKill('SIGTERM'); break;
+    case 'k': case 'K': doKill('SIGKILL'); break;
+    case 'r': case 'R':
+      statusMsg = 'Refreshing…';
+      render();
+      setTimeout(refresh, 30);
+      break;
+  }
+}
+
+// ── Lifecycle ─────────────────────────────────────────────────────────────────
+function quit() {
+  clearInterval(autoTimer);
+  process.stdout.write(A.showCursor + '\n');
+  process.exit(0);
+}
+
+process.stdin.setRawMode(true);
+process.stdin.resume();
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', handleKey);
+process.on('SIGINT',  quit);
+process.on('SIGTERM', quit);
+process.on('SIGHUP',  quit);
+process.stdout.on('resize', render);
+
+refresh();
+autoTimer = setInterval(() => { if (!killing) refresh(); }, AUTO_REFRESH);
