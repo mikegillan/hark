@@ -7,7 +7,7 @@
 // Usage:  hark [port]     (no port = all listening node processes)
 // Install: chmod +x hark && mv hark /usr/local/bin/hark
 //
-// Keys:  ↑↓ navigate   x sigterm   k sigkill   r refresh   esc/ctrl-c quit
+// Keys:  ↑↓ navigate   x sigterm   k sigkill   r refresh   q/esc quit
 // ──────────────────────────────────────────────────────────────────────────────
 
 const { execSync } = require('child_process');
@@ -259,7 +259,7 @@ function render() {
   out += `${A.reset}${A.yellow}x${A.reset}${A.dim} sigterm  `;
   out += `${A.reset}${A.brightRed}k${A.reset}${A.dim} sigkill  `;
   out += `${A.reset}${A.cyan}r${A.reset}${A.dim} refresh  `;
-  out += `${A.reset}${A.dim}esc / ctrl-c  quit${A.reset}\n`;
+  out += `${A.reset}${A.dim}q / esc  quit${A.reset}\n`;
 
   process.stdout.write(out);
 }
@@ -308,7 +308,8 @@ function doKill(signal) {
 function handleKey(chunk) {
   switch (chunk) {
     case '\x03':
-    case '\x1B':    quit(); break;
+    case '\x1B':
+    case 'q': case 'Q': quit(); break;
     case '\x1B[A':
       if (selectedIdx > 0) { selectedIdx--; statusMsg = ''; render(); }
       break;

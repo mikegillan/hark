@@ -68,7 +68,7 @@ hark 3000
 | `x` | Send `SIGTERM` (graceful shutdown) |
 | `k` | Send `SIGKILL` (force kill) |
 | `r` | Manual refresh |
-| `esc` / `ctrl-c` | Quit |
+| `q` / `esc` | Quit |
 
 ---
 
@@ -89,7 +89,7 @@ hark 3000
     └─ tcp 8080  server
 
 ────────────────────────────────────────────────────────────────────────────────
-  ↑↓ navigate  x sigterm  k sigkill  r refresh  esc / ctrl-c  quit
+  ↑↓ navigate  x sigterm  k sigkill  r refresh  q / esc  quit
 ```
 
 ### Kill flow
